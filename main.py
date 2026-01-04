@@ -56,7 +56,8 @@ async def check_live_stream():
                     await channel.send(
                         f'@everyone 🔴 **Live stream právě začal!**\n📺 **{title}**\n▶️ {url}',
                         allowed_mentions=discord.AllowedMentions(everyone=True)
-                        last_live_video_id = video_id
+                    )
+                    last_live_video_id = video_id
                 else:
                     print("⚠️ Kanál nebyl nalezen!")
         else:
