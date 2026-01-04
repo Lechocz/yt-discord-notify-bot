@@ -1,87 +1,105 @@
-from dotenv import load_dotenv
-load_dotenv()
-
 import os
-import discord
-from discord.ext import tasks
-from googleapiclient.discovery import build
-from flask import Flask
-from threading import Thread
+import time
+import json
+import requests
 
-# Načti proměnné z .env
-DISCORD_TOKEN = os.getenv("DISCORD_TOKEN")
-DISCORD_CHANNEL_ID = int(os.getenv("DISCORD_CHANNEL_ID"))
 YOUTUBE_API_KEY = os.getenv("YOUTUBE_API_KEY")
-YOUTUBE_CHANNEL_ID = os.getenv("YOUTUBE_CHANNEL_ID")
+YOUTUBE_CHANNEL_ID = os.getenv("YOUTUBE_CHANNEL_ID")  # např. UCxxxx
+DISCORD_WEBHOOK_URL = os.getenv("DISCORD_WEBHOOK_URL")
 
-intents = discord.Intents.default()
-intents.message_content = True
-bot = discord.Client(intents=intents)
+CHECK_EVERY_SECONDS = int(os.getenv("CHECK_EVERY_SECONDS", "60"))
+STATE_FILE = "state.json"
 
-youtube = build('youtube', 'v3', developerKey=YOUTUBE_API_KEY)
 
-last_live_video_id = None
-CHECK_INTERVAL = 60  # v sekundách
-
-# 🔁 TASK LOOP
-@tasks.loop(seconds=CHECK_INTERVAL)
-async def check_live_stream():
-    global last_live_video_id
-    print("Kontroluji YouTube live stream...")
-
+def load_state() -> dict:
+    if not os.path.exists(STATE_FILE):
+        return {"last_live_video_id": None}
     try:
-        request = youtube.search().list(
-            part='snippet',
-            channelId=YOUTUBE_CHANNEL_ID,
-            type='video',
-            eventType='live',
-            maxResults=1
+        with open(STATE_FILE, "r", encoding="utf-8") as f:
+            return json.load(f)
+    except Exception:
+        return {"last_live_video_id": None}
+
+
+def save_state(state: dict) -> None:
+    with open(STATE_FILE, "w", encoding="utf-8") as f:
+        json.dump(state, f)
+
+
+def get_current_live_video():
+    """
+    Vrátí tuple (video_id, title) pokud je kanál live, jinak (None, None)
+    Používá YouTube Search endpoint s eventType=live.
+    """
+    url = "https://www.googleapis.com/youtube/v3/search"
+    params = {
+        "part": "snippet",
+        "channelId": YOUTUBE_CHANNEL_ID,
+        "eventType": "live",
+        "type": "video",
+        "maxResults": 1,
+        "key": YOUTUBE_API_KEY,
+    }
+    r = requests.get(url, params=params, timeout=15)
+    r.raise_for_status()
+    data = r.json()
+
+    items = data.get("items", [])
+    if not items:
+        return None, None
+
+    item = items[0]
+    video_id = item["id"]["videoId"]
+    title = item["snippet"]["title"]
+    return video_id, title
+
+
+def send_discord_everyone(message: str) -> None:
+    payload = {
+        "content": f"@everyone {message}",
+        "allowed_mentions": {"parse": ["everyone"]},
+    }
+    r = requests.post(DISCORD_WEBHOOK_URL, json=payload, timeout=15)
+    r.raise_for_status()
+
+
+def main():
+    if not (YOUTUBE_API_KEY and YOUTUBE_CHANNEL_ID and DISCORD_WEBHOOK_URL):
+        raise SystemExit(
+            "Chybí ENV proměnné: YOUTUBE_API_KEY, YOUTUBE_CHANNEL_ID, DISCORD_WEBHOOK_URL"
         )
-        response = request.execute()
 
-        print("YouTube API odpověď:", response)
+    state = load_state()
+    last_live_video_id = state.get("last_live_video_id")
 
-        if response['items']:
-            live_video = response['items'][0]
-            video_id = live_video['id']['videoId']
-            title = live_video['snippet']['title']
-            url = f'https://www.youtube.com/watch?v={video_id}'
+    print("Bot běží. Kontroluju live status...")
 
-            print(f"Živý stream nalezen: {title} ({video_id})")
+    while True:
+        try:
+            video_id, title = get_current_live_video()
 
-            if video_id != last_live_video_id:
-                print('📣 Posílám zprávu na Discord...')
-                channel = bot.get_channel(DISCORD_CHANNEL_ID)
-                if channel:
-                    await channel.send(f'🔴 **Live stream právě začal!**\n📺 **{title}**\n▶️ {url}')
+            if video_id:
+                # Je live
+                if video_id != last_live_video_id:
+                    stream_url = f"https://www.youtube.com/watch?v={video_id}"
+                    msg = f"🔴 **Stream právě začal!**\n**{title}**\n{stream_url}"
+                    send_discord_everyone(msg)
+                    print("Odesláno na Discord:", title, stream_url)
+
                     last_live_video_id = video_id
+                    state["last_live_video_id"] = last_live_video_id
+                    save_state(state)
                 else:
-                    print("⚠️ Kanál nebyl nalezen!")
-        else:
-            print("Momentálně není žádný živý stream.")
-            last_live_video_id = None
+                    print("Stále live (už oznámeno).")
+            else:
+                # Není live -> necháme last id, ať další nový stream pošle znovu
+                print("Offline.")
 
-    except Exception as e:
-        print(f"❌ Chyba při kontrole live streamu: {e}")
+        except Exception as e:
+            print("Chyba:", repr(e))
 
-@bot.event
-async def on_ready():
-    print(f"✅ Bot je připojen jako {bot.user}")
-    print(f"Servery, kde je bot přítomen: {[guild.name for guild in bot.guilds]}")
-    check_live_stream.start()  # 💥 Toto spouští loop
+        time.sleep(CHECK_EVERY_SECONDS)
 
-# 🌐 Keep Replit alive
-app = Flask('')
 
-@app.route('/')
-def home():
-    return "Bot je online!"
-
-def run():
-    app.run(host='0.0.0.0', port=8080)
-
-def keep_alive():
-    Thread(target=run).start()
-
-keep_alive()
-bot.run(DISCORD_TOKEN)
+if __name__ == "__main__":
+    main()
